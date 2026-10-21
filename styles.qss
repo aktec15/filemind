@@ -1,0 +1,29 @@
+QWidget { background: #15181e; color: #e8ecf2; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+QMainWindow, QDialog { background: #15181e; }
+QMenuBar, QToolBar { background: #1c2028; border: none; padding: 5px; spacing: 8px; }
+QMenu { background: #232833; border: 1px solid #363d4b; }
+QMenu::item:selected { background: #344a70; }
+QListWidget { background: #1c2028; border: none; padding: 10px; outline: none; }
+QListWidget::item { padding: 10px 14px; border-radius: 6px; margin: 2px 0; }
+QListWidget::item:selected { background: #293e60; color: #91baff; }
+QLineEdit, QComboBox, QDoubleSpinBox, QDateEdit { background: #20252f; border: 1px solid #343c49; border-radius: 5px; padding: 7px; selection-background-color: #476da5; }
+QPushButton { background: #29313f; border: 1px solid #3c4758; border-radius: 5px; padding: 8px 13px; }
+QPushButton:hover { background: #354461; border-color: #719be2; }
+QPushButton:disabled { color: #697383; background: #20252c; }
+QPushButton#primary { background: #4776bf; border-color: #628bd0; color: white; }
+QLabel#title { font-size: 27px; font-weight: 600; }
+QLabel#subtitle { color: #929eb0; }
+QTableView, QTreeWidget { background: #191d25; alternate-background-color: #1e232d; border: 1px solid #303744; gridline-color: #2b323e; selection-background-color: #304f7c; }
+QHeaderView::section { background: #232a35; border: none; border-bottom: 1px solid #394352; padding: 10px; font-weight: 600; }
+QProgressBar { border: none; background: #262e3b; border-radius: 3px; max-height: 7px; }
+QProgressBar::chunk { background: #79a8f5; }
+QStatusBar { color: #a0adbf; }
+QCheckBox { spacing: 7px; }
+QToolTip { background: #29313f; color: white; border: 1px solid #4c5c74; }
+
+QScrollBar:vertical { background: #1c2028; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #404b5e; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+QToolButton { padding: 5px 8px; border-radius: 4px; }
+QToolButton:hover { background: #354461; }
