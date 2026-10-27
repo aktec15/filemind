@@ -20,6 +20,9 @@ from duplicate_finder import DuplicateFinder
 from file_organizer import FileOrganizer, duplicate_removal_plan
 from file_search import SearchFilters
 from workers import Worker
+from ai_settings import AIError, load_config, connection_from, validate_workspaces
+from ai_advisor import candidate_folders, metadata_payload, YandexAdvisor, advice_plans
+from ai_dialogs import AISettingsDialog, MetadataDialog, AdviceDialog
 
 class FileTableModel(QAbstractTableModel):
     headers = ['Name', 'Extension', 'Size', 'Modified', 'Path']
@@ -80,26 +83,27 @@ class MoveTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return ['Source', 'Destination', 'Name conflict'][section]
+            return ['Source', 'Destination', 'Details'][section]
 
     def data(self, index, role=Qt.DisplayRole):
         if index.isValid() and role in (Qt.DisplayRole, Qt.ToolTipRole):
             plan = self.plans[index.row()]
             return [str(plan.source), str(plan.destination),
-                    'Renamed safely' if plan.conflict else '—'][index.column()]
+                    ('Whole folder' if plan.is_directory else 'File') + ('; renamed safely' if plan.conflict else '')][index.column()]
 
 class PreviewDialog(QDialog):
     def __init__(self, plans, parent):
         super().__init__(parent)
-        self.setWindowTitle('Review file moves')
+        self.setWindowTitle('Review folder and file moves')
         self.resize(920, 520)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f'{len(plans):,} files will be moved. Existing files will never be overwritten.'))
+        layout.addWidget(QLabel(f'{len(plans):,} items will be moved. Folders keep their complete contents. Existing paths will never be overwritten.'))
         table = QTableView()
         table.setModel(MoveTableModel(plans, table))
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(table)
+        layout.addWidget(QLabel('Moved projects may need their virtual environments recreated.'))
         layout.addWidget(QLabel('Cancel stops after the current safe step. Completed moves can be restored from History.'))
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText('Confirm moves')
@@ -147,7 +151,7 @@ class MainWindow(QMainWindow):
         self.navigation.setCurrentRow(0)
         self.navigation.currentTextChanged.connect(self.navigate)
         side.addWidget(self.navigation)
-        local = QLabel('LOCAL BY DESIGN\nYour files stay on your computer')
+        local = QLabel('FILES STAY LOCAL\nOptional AI advice sends reviewed metadata')
         local.setObjectName('subtitle')
         local.setWordWrap(True)
         side.addWidget(local)
@@ -298,7 +302,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(content)
         splitter.setSizes([210, 890])
         splitter.setStretchFactor(1, 1)
-        self.statusBar().showMessage('Ready · Local processing only')
+        self.statusBar().showMessage('Ready · AI advice is optional')
 
     def build_actions(self):
         file_menu = self.menuBar().addMenu('File')
@@ -312,7 +316,8 @@ class MainWindow(QMainWindow):
         entries = [
             (file_menu, 'Open Folder', lambda: self.open_folder(), QStyle.SP_DirOpenIcon, 'Ctrl+O'),
             (file_menu, 'Rescan Folder', self.rescan, QStyle.SP_BrowserReload, 'F5'),
-            (tools_menu, 'Organize Files', self.organize, QStyle.SP_DirIcon, ''),
+            (tools_menu, 'Organize Folders', self.organize, QStyle.SP_DirIcon, ''),
+            (tools_menu, 'AI Advisor', self.ai_advise, QStyle.SP_MessageBoxInformation, ''),
             (tools_menu, 'Find Duplicates', self.find_duplicates, QStyle.SP_FileDialogContentsView, ''),
             (tools_menu, 'Search Files', self.focus_search, QStyle.SP_FileDialogDetailedView, 'Ctrl+F'),
         ]
@@ -328,11 +333,12 @@ class MainWindow(QMainWindow):
             self.task_actions.append(action)
         settings = tools_menu.addAction('Settings')
         settings.triggered.connect(self.show_settings)
+        tools_menu.addAction('AI settings', self.show_ai_settings)
         file_menu.addSeparator()
         file_menu.addAction('Exit', self.close)
         help_menu.addAction('About FileMind', lambda: self.inform('About FileMind',
             'FileMind 1.0\nLocal file organizer for Windows 10/11.\n'
-            'SHA-256 duplicate detection · SQLite history\nNo uploads or paid services.'))
+            'SHA-256 duplicate detection · SQLite history\nOptional YandexGPT advice sends reviewed folder metadata.'))
 
     def inform(self, title, message):
         QMessageBox.information(self, title, message)
@@ -366,6 +372,80 @@ class MainWindow(QMainWindow):
 
     def busy(self):
         return self.worker is not None
+
+    def show_ai_settings(self):
+        if self.busy():
+            return
+        try:
+            AISettingsDialog(load_config(self.db), self.db, self).exec()
+        except AIError as error:
+            self.report_error(str(error))
+
+    def when_idle(self, callback):
+        if self.busy():
+            QTimer.singleShot(25, lambda: self.when_idle(callback))
+        else:
+            callback()
+
+    def ai_advise(self):
+        if self.busy():
+            return
+        if not self.root:
+            self.open_folder()
+            return
+        try:
+            config = load_config(self.db)
+            if not config['workspaces']:
+                if AISettingsDialog(config, self.db, self).exec() != QDialog.Accepted:
+                    return
+                config = load_config(self.db)
+            validate_workspaces(config['workspaces'])
+        except AIError as error:
+            self.report_error(str(error))
+            return
+        root = self.root
+        workspaces = config['workspaces']
+        def ready(candidates):
+            self.when_idle(lambda: self.send_ai_metadata(root, candidates, workspaces, config))
+        self.run_task('Preparing AI folder metadata',
+                      lambda cancel, progress: candidate_folders(root, cancel), ready)
+
+    def send_ai_metadata(self, root, candidates, workspaces, config):
+        if self.root != root:
+            return
+        if not candidates:
+            self.inform('AI Advisor', 'No folders to classify. Folders already in Workspaces stay in place.')
+            return
+        try:
+            metadata = metadata_payload(root, candidates, workspaces)
+            if MetadataDialog(metadata, self).exec() != QDialog.Accepted:
+                return
+            connection = connection_from(config)
+        except AIError as error:
+            self.report_error(str(error))
+            return
+        def ready(advice):
+            self.when_idle(lambda: self.review_ai_advice(root, candidates, advice, workspaces))
+        self.run_task('Asking YandexGPT · no folders are moving',
+                      lambda cancel, progress: YandexAdvisor(connection).suggest(metadata, cancel), ready)
+
+    def review_ai_advice(self, root, candidates, advice, workspaces):
+        if self.root != root:
+            return
+        dialog = AdviceDialog(root, candidates, advice, workspaces, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            plans = advice_plans(root, candidates, dialog.selected_workspaces(), workspaces)
+        except (OSError, ValueError) as error:
+            self.report_error(str(error))
+            return
+        if not plans:
+            self.inform('AI Advisor', 'All folders were left in place.')
+            return
+        if PreviewDialog(plans, self).exec() == QDialog.Accepted:
+            self.run_task('Organizing folders by workspace', lambda cancel, progress:
+                          self.organizer.execute(plans, root, cancel, progress), self.moves_done)
 
     def run_task(self, title, task, callback):
         if self.busy():
@@ -528,8 +608,8 @@ class MainWindow(QMainWindow):
         if not self.root:
             self.open_folder()
             return
-        root, records = self.root, list(self.records)
-        self.run_task('Preparing move preview', lambda cancel, progress: self.organizer.preview(root, records, cancel), self.preview_ready)
+        root = self.root
+        self.run_task('Preparing folder preview', lambda cancel, progress: self.organizer.preview(root, cancel), self.preview_ready)
 
     def preview_ready(self, plans):
         # Result arrives before QThread.finished; queue the dialog for the next event turn.
@@ -540,16 +620,16 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(25, lambda: self.show_preview_when_ready(plans))
             return
         if not plans:
-            self.inform('Organize files', 'All scanned files are already in their category folders.')
+            self.inform('Organize folders', 'No folders to move. Loose files, hidden folders and category folders stay in place.')
             return
         if PreviewDialog(plans, self).exec() == QDialog.Accepted:
             root = self.root
-            self.run_task('Organizing files', lambda cancel, progress:
+            self.run_task('Organizing folders', lambda cancel, progress:
                           self.organizer.execute(plans, root, cancel, progress), self.moves_done)
 
     def moves_done(self, result):
         count, errors = result
-        self.inform('Operation complete', f'{count:,} files moved.\nCompleted moves can be restored from History.' +
+        self.inform('Operation complete', f'{count:,} items moved.\nCompleted moves can be restored from History.' +
                     (f'\n{len(errors)} errors:\n' + '\n'.join(errors[:8]) if errors else ''))
         QTimer.singleShot(100, self.rescan_when_ready)
 
@@ -690,11 +770,11 @@ class MainWindow(QMainWindow):
         if operation['status'] != 'completed' or operation['kind'] == 'restore':
             self.report_error('Select a completed organize or quarantine operation.')
             return
-        answer = QMessageBox.question(self, 'Restore file',
-            f"Move this file back?\n{operation['destination']}\n→ {operation['source']}\nExisting files will not be overwritten.",
+        answer = QMessageBox.question(self, 'Restore item',
+            f"Move this item back?\n{operation['destination']}\n→ {operation['source']}\nExisting files will not be overwritten.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer == QMessageBox.Yes:
-            self.run_task('Restoring file', lambda cancel, progress: self.organizer.undo(operation_id, cancel),
+            self.run_task('Restoring item', lambda cancel, progress: self.organizer.undo(operation_id, cancel),
                           lambda _: QTimer.singleShot(100, self.rescan_when_ready))
 
     def closeEvent(self, event):

@@ -9,12 +9,14 @@ from database import Database
 from duplicate_finder import sha256, CancelledError
 from models import FileRecord
 from filesystem import is_link
+from folder_organizer import DESTINATIONS, is_project, folder_category, folder_fingerprint, rename_folder
 
 @dataclass(frozen=True)
 class MovePlan:
     source: Path
     destination: Path
     conflict: bool = False
+    is_directory: bool = False
 
 
 def protected(path: Path) -> bool:
@@ -41,11 +43,11 @@ def validate_location(path: Path, root: Path) -> None:
         raise ValueError('Choose a personal folder, not a drive root or system folder.')
 
 
-def unique_destination(path: Path, reserved: set[Path]) -> Path:
+def unique_destination(path: Path, reserved: set[Path], is_directory: bool = False) -> Path:
     candidate = path
     index = 1
     while candidate.exists() or candidate.is_symlink() or candidate in reserved:
-        candidate = path.with_name(f'{path.stem} ({index}){path.suffix}')
+        candidate = path.with_name(f'{path.name} ({index})' if is_directory else f'{path.stem} ({index}){path.suffix}')
         index += 1
     return candidate
 
@@ -53,23 +55,26 @@ class FileOrganizer:
     def __init__(self, database: Database):
         self.database = database
 
-    def preview(self, root: Path, records: list[FileRecord], cancel: Event | None = None) -> list[MovePlan]:
+    def preview(self, root: Path, cancel: Event | None = None) -> list[MovePlan]:
         root = root.absolute()
+        validate_location(root, root)
+        if is_project({path.name for path in root.iterdir()}):
+            raise ValueError('The selected folder is a project. Select its parent folder to organize it as a whole.')
         reserved: set[Path] = set()
         plans = []
-        for record in records:
+        for source in sorted(root.iterdir()):
             if cancel and cancel.is_set():
                 raise CancelledError('Preview cancelled.')
-            source = record.path.absolute()
-            validate_location(source, root)
-            target_folder = root / record.category
-            if source.parent == target_folder:
+            if (source.name.casefold() in {name.casefold() for name in DESTINATIONS} or source.name.startswith('.')
+                    or is_link(source) or not source.is_dir()):
                 continue
+            validate_location(source, root)
+            target_folder = root / folder_category(source, cancel)
             destination = target_folder / source.name
             validate_location(destination, root)
-            safe = unique_destination(destination, reserved)
+            safe = unique_destination(destination, reserved, is_directory=True)
             reserved.add(safe)
-            plans.append(MovePlan(source, safe, safe != destination))
+            plans.append(MovePlan(source, safe, safe != destination, True))
         return plans
 
     def move(self, plan: MovePlan, root: Path, kind: str = 'organize',
@@ -79,6 +84,8 @@ class FileOrganizer:
         validate_location(destination, root)
         if cancel and cancel.is_set():
             raise CancelledError('Operation cancelled.')
+        if plan.is_directory:
+            return self.move_folder(plan, root, kind, cancel)
         fingerprint = sha256(source, cancel)
         operation_id = self.database.begin_operation(kind, source, destination, fingerprint)
         created = False
@@ -112,6 +119,28 @@ class FileOrganizer:
             self.database.finish_operation(operation_id, 'recovery_needed' if removed else 'failed', str(error))
             raise
 
+    def move_folder(self, plan: MovePlan, root: Path, kind: str,
+                    cancel: Event | None) -> int:
+        source, destination = plan.source, plan.destination
+        if not source.is_dir() or destination.is_relative_to(source):
+            raise ValueError('Invalid folder move.')
+        fingerprint = folder_fingerprint(source, cancel)
+        operation_id = self.database.begin_operation(kind, source, destination, fingerprint)
+        moved = False
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            validate_location(source, root)
+            validate_location(destination, root)
+            if cancel and cancel.is_set():
+                raise CancelledError('Operation cancelled.')
+            rename_folder(source, destination)
+            moved = True
+            self.database.finish_operation(operation_id, 'completed')
+            return operation_id
+        except BaseException as error:
+            self.database.finish_operation(operation_id, 'recovery_needed' if moved else 'failed', str(error))
+            raise
+
     def execute(self, plans: list[MovePlan], root: Path, cancel: Event | None = None,
                 progress: Callable[[int], None] = lambda _: None, kind: str = 'organize') -> tuple[int, list[str]]:
         completed = 0
@@ -137,10 +166,12 @@ class FileOrganizer:
         destination = Path(operation['source'])
         if destination.exists() or destination.is_symlink():
             raise FileExistsError('Original path is occupied; nothing was overwritten.')
-        if sha256(source, cancel) != operation['fingerprint']:
-            raise ValueError('The moved file has changed. Restore it manually.')
+        is_directory = operation['fingerprint'].startswith('directory-sha256:')
+        fingerprint = folder_fingerprint(source, cancel) if is_directory else sha256(source, cancel)
+        if fingerprint != operation['fingerprint']:
+            raise ValueError('The moved item has changed. Restore it manually.')
         root = Path(os.path.commonpath([source.parent, destination.parent]))
-        self.move(MovePlan(source, destination), root, 'restore', cancel)
+        self.move(MovePlan(source, destination, is_directory=is_directory), root, 'restore', cancel)
         self.database.finish_operation(operation_id, 'restored')
 
 

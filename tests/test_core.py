@@ -75,11 +75,12 @@ def test_duplicate_cancel(workspace):
 
 def test_organize_preview_conflicts_undo(workspace):
     root, db, organizer = workspace
-    source = write(root, 'a.txt', b'new')
-    existing = write(root, 'Documents/a.txt', b'old')
-    plans = organizer.preview(root, records(root))
+    source = write(root, 'notes/a.txt', b'new')
+    existing = write(root, 'Documents/notes/old.txt', b'old')
+    plans = organizer.preview(root)
     assert len(plans) == 1
     assert plans[0].conflict
+    assert plans[0].is_directory
     assert source.exists()  # Preview must not modify anything.
     count, errors = organizer.execute(plans, root)
     assert (count, errors) == (1, [])
@@ -92,7 +93,7 @@ def test_organize_preview_conflicts_undo(workspace):
 def test_late_conflict_never_overwritten(workspace):
     root, db, organizer = workspace
     source = write(root, 'a.txt')
-    plan = organizer.preview(root, records(root))[0]
+    plan = MovePlan(source, root / 'Documents' / source.name)
     write(root, 'Documents/a.txt', b'do not overwrite')
     with pytest.raises(FileExistsError):
         organizer.move(plan, root)
@@ -103,7 +104,7 @@ def test_late_conflict_never_overwritten(workspace):
 def test_undo_protects_occupied_source(workspace):
     root, db, organizer = workspace
     source = write(root, 'a.txt')
-    organizer.execute(organizer.preview(root, records(root)), root)
+    organizer.move(MovePlan(source, root / 'Documents' / source.name), root)
     source.write_bytes(b'new data')
     with pytest.raises(FileExistsError):
         organizer.undo(db.history()[0]['id'])
@@ -111,8 +112,8 @@ def test_undo_protects_occupied_source(workspace):
 
 def test_undo_protects_modified_destination(workspace):
     root, db, organizer = workspace
-    write(root, 'a.txt')
-    plan = organizer.preview(root, records(root))[0]
+    source = write(root, 'a.txt')
+    plan = MovePlan(source, root / 'Documents' / source.name)
     organizer.move(plan, root)
     plan.destination.write_bytes(b'edited')
     with pytest.raises(ValueError):
@@ -122,7 +123,7 @@ def test_undo_protects_modified_destination(workspace):
 def test_cancelled_move_keeps_original(workspace):
     root, _, organizer = workspace
     source = write(root, 'a.txt')
-    plan = organizer.preview(root, records(root))[0]
+    plan = MovePlan(source, root / 'Documents' / source.name)
     cancel = Event()
     cancel.set()
     assert organizer.execute([plan], root, cancel) == (0, [])
@@ -135,8 +136,10 @@ def test_symlink_target_rejected(workspace, tmp_path):
     outside = tmp_path / 'outside'
     outside.mkdir()
     (root / 'Documents').symlink_to(outside, target_is_directory=True)
+    (root / 'notes').mkdir()
+    write(root, 'notes/b.txt')
     with pytest.raises(ValueError):
-        organizer.preview(root, records(root))
+        organizer.preview(root)
     assert source.exists()
     assert not list(outside.iterdir())
 
@@ -191,7 +194,7 @@ def test_access_error_is_reported(workspace, monkeypatch):
 def test_copy_failure_keeps_source_and_cleans_partial(workspace, monkeypatch):
     root, db, organizer = workspace
     source = write(root, 'a.txt')
-    plan = organizer.preview(root, records(root))[0]
+    plan = MovePlan(source, root / 'Documents' / source.name)
     monkeypatch.setattr('file_organizer.os.fsync', lambda _: (_ for _ in ()).throw(OSError('Disk full')))
     with pytest.raises(OSError, match='Disk full'):
         organizer.move(plan, root)
@@ -201,12 +204,12 @@ def test_copy_failure_keeps_source_and_cleans_partial(workspace, monkeypatch):
 
 def test_multiple_conflicts_in_one_preview(workspace):
     root, _, organizer = workspace
-    write(root, 'one/a.txt', b'one')
-    write(root, 'two/a.txt', b'two')
-    plans = organizer.preview(root, records(root))
+    write(root, 'one/notes/a.txt', b'one')
+    write(root, 'two/notes/a.txt', b'two')
+    plans = organizer.preview(root)
     assert len({p.destination for p in plans}) == 2
     assert organizer.execute(plans, root) == (2, [])
-    assert {p.read_bytes() for p in (root / 'Documents').iterdir()} == {b'one', b'two'}
+    assert {p.read_bytes() for p in (root / 'Documents').rglob('a.txt')} == {b'one', b'two'}
 
 def test_parent_traversal_rejected(workspace, tmp_path):
     root, _, organizer = workspace
@@ -219,7 +222,7 @@ def test_parent_traversal_rejected(workspace, tmp_path):
 def test_cancel_during_copy_keeps_source(workspace, monkeypatch):
     root, db, organizer = workspace
     source = write(root, 'a.txt', b'data' * 1000)
-    plan = organizer.preview(root, records(root))[0]
+    plan = MovePlan(source, root / 'Documents' / source.name)
     cancel = Event()
     real_fsync = __import__('os').fsync
     def cancel_after_flush(fd):
@@ -235,7 +238,7 @@ def test_cancel_during_copy_keeps_source(workspace, monkeypatch):
 def test_edit_during_copy_keeps_new_source(workspace, monkeypatch):
     root, _, organizer = workspace
     source = write(root, 'a.txt', b'original')
-    plan = organizer.preview(root, records(root))[0]
+    plan = MovePlan(source, root / 'Documents' / source.name)
     real_fsync = __import__('os').fsync
     def edit_after_flush(fd):
         real_fsync(fd)
